@@ -13,12 +13,14 @@ import (
 // specified by the schedule. It may be started, stopped, and the entries may
 // be inspected while running.
 type Cron struct {
-	entries  []*Entry
-	stop     chan struct{}
-	add      chan *Entry
-	snapshot chan []*Entry
-	running  bool
-	ErrorLog *log.Logger
+	entries           []*Entry
+	stop              chan struct{} // 停止任务
+	add               chan *Entry   // 添加任务
+	remove            chan int      // 删除任务
+	currentScheduleId int           // 添加新任务时的ID
+	snapshot          chan []*Entry
+	running           bool
+	ErrorLog          *log.Logger
 }
 
 // Job is an interface for submitted cron jobs.
@@ -35,6 +37,15 @@ type Schedule interface {
 
 // Entry consists of a schedule and the func to execute on that schedule.
 type Entry struct {
+	// 任务描述信息
+	Desc string
+
+	// 执行频率数值
+	Spec string
+
+	// 任务的唯一识别ID
+	Id int
+
 	// The schedule on which this job should be run.
 	Schedule Schedule
 
@@ -72,12 +83,14 @@ func (s byTime) Less(i, j int) bool {
 // New returns a new Cron job runner.
 func New() *Cron {
 	return &Cron{
-		entries:  nil,
-		add:      make(chan *Entry),
-		stop:     make(chan struct{}),
-		snapshot: make(chan []*Entry),
-		running:  false,
-		ErrorLog: nil,
+		entries:           nil,
+		add:               make(chan *Entry),
+		remove:            make(chan int),
+		stop:              make(chan struct{}),
+		snapshot:          make(chan []*Entry),
+		currentScheduleId: 0,
+		running:           false,
+		ErrorLog:          nil,
 	}
 }
 
@@ -87,32 +100,46 @@ type FuncJob func()
 func (f FuncJob) Run() { f() }
 
 // AddFunc adds a func to the Cron to be run on the given schedule.
-func (c *Cron) AddFunc(spec string, cmd func()) error {
-	return c.AddJob(spec, FuncJob(cmd))
+func (c *Cron) AddFunc(desc, spec string, cmd func()) (int, error) {
+	return c.AddJob(desc, spec, FuncJob(cmd))
+}
+
+// 删除计划任务
+func (c *Cron) RemoveFunc(id int) {
+	if !c.running {
+		c.delEntry(id)
+	} else {
+		c.remove <- id
+	}
 }
 
 // AddJob adds a Job to the Cron to be run on the given schedule.
-func (c *Cron) AddJob(spec string, cmd Job) error {
+func (c *Cron) AddJob(desc, spec string, cmd Job) (int, error) {
 	schedule, err := Parse(spec)
 	if err != nil {
-		return err
+		return -1, err
 	}
-	c.Schedule(schedule, cmd)
-	return nil
+	scheduleId := c.Schedule(desc, spec, schedule, cmd)
+	return scheduleId, nil
 }
 
 // Schedule adds a Job to the Cron to be run on the given schedule.
-func (c *Cron) Schedule(schedule Schedule, cmd Job) {
+func (c *Cron) Schedule(desc, spec string, schedule Schedule, cmd Job) int {
+	c.currentScheduleId++
 	entry := &Entry{
+		Desc:     desc,
+		Spec:     spec,
+		Id:       c.currentScheduleId,
 		Schedule: schedule,
 		Job:      cmd,
 	}
 	if !c.running {
 		c.entries = append(c.entries, entry)
-		return
+	} else {
+		c.add <- entry
 	}
 
-	c.add <- entry
+	return c.currentScheduleId
 }
 
 // Entries returns a snapshot of the cron entries.
@@ -182,6 +209,9 @@ func (c *Cron) run() {
 			c.entries = append(c.entries, newEntry)
 			newEntry.Next = newEntry.Schedule.Next(time.Now().Local())
 
+		case id := <-c.remove:
+			c.delEntry(id)
+
 		case <-c.snapshot:
 			c.snapshot <- c.entrySnapshot()
 
@@ -203,6 +233,15 @@ func (c *Cron) logf(format string, args ...interface{}) {
 	}
 }
 
+// 删除计划任务
+func (c *Cron) delEntry(id int) {
+	for i, entry := range c.entries {
+		if entry.Id == id {
+			c.entries = append(c.entries[:i], c.entries[i+1:]...)
+		}
+	}
+}
+
 // Stop stops the cron scheduler if it is running; otherwise it does nothing.
 func (c *Cron) Stop() {
 	if !c.running {
@@ -217,6 +256,8 @@ func (c *Cron) entrySnapshot() []*Entry {
 	entries := []*Entry{}
 	for _, e := range c.entries {
 		entries = append(entries, &Entry{
+			Desc:     e.Desc,
+			Spec:     e.Spec,
 			Schedule: e.Schedule,
 			Next:     e.Next,
 			Prev:     e.Prev,
